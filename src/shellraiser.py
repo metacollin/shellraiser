@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""bash2c – Bash-to-C transpiler.
+"""shellraiser – Bash-to-C transpiler.
 
 Parses a practical subset of Bash and emits C source code that links
 against the bash_runtime library to produce a native binary.
 
 Usage:
-    bash2c script.sh                   # transpile + compile → ./script
-    bash2c script.sh -o mybin          # custom output name
-    bash2c script.sh --emit-only       # print C to stdout, no compile
-    bash2c script.sh --save-source     # keep the .c file
-    bash2c script.sh --compiler clang  # use a specific compiler
-    bash2c script.sh --cflags="-O2 -g" # custom compiler flags
+    shellraiser script.sh                   # transpile + compile → ./script
+    shellraiser script.sh -o mybin          # custom output name
+    shellraiser script.sh --emit-only       # print C to stdout, no compile
+    shellraiser script.sh --save-source     # keep the .c file
+    shellraiser script.sh --compiler clang  # use a specific compiler
+    shellraiser script.sh --cflags="-O2 -g" # custom compiler flags
 """
 
 import sys
@@ -949,7 +949,45 @@ class Parser:
         if t.type == TT.LPAREN:
             return self._subshell()
 
+        # [[ ... ]] extended test — consume everything up to ]] as a single command
+        # This prevents && and || inside [[ ]] from being parsed as command separators
+        if t.type == TT.WORD and t.value == '[[':
+            return self._dblbracket_command()
+
         return self._simple_command()
+
+    def _dblbracket_command(self) -> SimpleCommand:
+        """Parse: [[ expr ]] — collect all tokens including && || as arguments."""
+        args = [self._cur_as_word()]
+        self._advance()  # consume [[
+
+        while self._cur().type != TT.EOF:
+            t = self._cur()
+            # Check for ]] as a WORD
+            if t.type == TT.WORD and t.value == ']]':
+                args.append(self._cur_as_word())
+                self._advance()
+                break
+            # Collect all token types as arguments (&&, ||, !, etc.)
+            if t.type in (TT.AND, TT.OR, TT.BANG):
+                args.append(Word(parts=[LiteralPart(t.value)]))
+                self._advance()
+            elif self._is_word_token():
+                args.append(self._cur_as_word())
+                self._advance()
+            elif self._is_redirect():
+                # redirections after ]] are possible but rare; skip for now
+                self._advance()
+            elif t.type in (TT.NEWLINE, TT.SEMI, TT.EOF):
+                break  # ]] was missing — break to avoid infinite loop
+            else:
+                args.append(Word(parts=[LiteralPart(t.value)]))
+                self._advance()
+
+        cmd = SimpleCommand(args=args)
+        cmd._array_idx_assigns = []
+        cmd._inline_array_inits = []
+        return cmd
 
     def _subshell(self) -> SubshellNode:
         """Parse: ( command_list )"""
@@ -1427,17 +1465,46 @@ class CodeGen:
 
         header = [
             '#include "bash_runtime.h"',
+            '#include <string.h>',
             '',
         ]
 
-        # Forward declarations
+        # Forward declarations (not static — needed by function table)
         for fd in self.functions:
             cname = self._c_func_name(fd.name)
-            header.append(f'static int {cname}(int argc, char **argv);')
+            header.append(f'int {cname}(int argc, char **argv);')
+
+        # Function registration table
+        if self.functions:
+            header.append('')
+            header.append(f'static FuncEntry _shellraiser_func_table[] = {{')
+            for fd in self.functions:
+                cname = self._c_func_name(fd.name)
+                header.append(f'    {{ "{c_escape(fd.name)}", {cname} }},')
+            header.append('};')
+            header.append(f'static int _shellraiser_func_count = {len(self.functions)};')
+        else:
+            header.append('')
+            header.append('static FuncEntry *_shellraiser_func_table = NULL;')
+            header.append('static int _shellraiser_func_count = 0;')
 
         header.append('')
         header.append('int main(int argc, char **argv) {')
         header.append('    rt_init(argc, argv);')
+        header.append('    rt_register_functions(_shellraiser_func_table, _shellraiser_func_count);')
+        header.append('')
+
+        # --call dispatch: if argv[1] is "--call", route to named function
+        header.append('    /* --call dispatch for exported function invocation */')
+        header.append('    if (argc >= 3 && strcmp(argv[1], "--call") == 0) {')
+        header.append('        const char *fname = argv[2];')
+        header.append('        /* shift argv so the function sees its own args */')
+        header.append('        int fargc = argc - 2;')
+        header.append('        char **fargv = argv + 2;')
+        header.append('        int rc = rt_dispatch_call(fname, fargc, fargv);')
+        header.append('        rt_cleanup();')
+        header.append('        return rc;')
+        header.append('    }')
         header.append('')
 
         self.lines = []
@@ -1472,7 +1539,7 @@ class CodeGen:
     def _gen_function(self, fd: FunctionDef) -> List[str]:
         cname = self._c_func_name(fd.name)
         lines = [
-            f'static int {cname}(int argc, char **argv) {{',
+            f'int {cname}(int argc, char **argv) {{',
             '    rt_push_scope();',
             '    rt_push_args(argc, argv);',
             '',
@@ -2602,14 +2669,14 @@ def main():
 
     # ── CLI ──
     p = argparse.ArgumentParser(
-        prog='bash2c',
+        prog='shellraiser',
         description='Transpile Bash scripts to C and compile them into native binaries.',
         epilog='Examples:\n'
-               '  bash2c script.sh                  → ./script\n'
-               '  bash2c script.sh -o mybin          → ./mybin\n'
-               '  bash2c script.sh --emit-only       → prints C to stdout\n'
-               '  bash2c script.sh --save-source     → keeps script.c alongside binary\n'
-               '  bash2c script.sh --compiler clang --cflags="-O2 -g"\n',
+               '  shellraiser script.sh                  → ./script\n'
+               '  shellraiser script.sh -o mybin          → ./mybin\n'
+               '  shellraiser script.sh --emit-only       → prints C to stdout\n'
+               '  shellraiser script.sh --save-source     → keeps script.c alongside binary\n'
+               '  shellraiser script.sh --compiler clang --cflags="-O2 -g"\n',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument('script', help='Bash script to transpile')
@@ -2633,7 +2700,7 @@ def main():
         with open(args.script, 'r') as f:
             source = f.read()
     except FileNotFoundError:
-        print(f"bash2c: error: file '{args.script}' not found", file=sys.stderr)
+        print(f"shellraiser: error: file '{args.script}' not found", file=sys.stderr)
         sys.exit(1)
 
     if source.startswith('#!'):
@@ -2643,10 +2710,10 @@ def main():
     try:
         c_code = transpile(source)
     except ParseError as e:
-        print(f"bash2c: parse error: {e}", file=sys.stderr)
+        print(f"shellraiser: parse error: {e}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        print(f"bash2c: error: {e}", file=sys.stderr)
+        print(f"shellraiser: error: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc(file=sys.stderr)
         sys.exit(1)
@@ -2659,8 +2726,8 @@ def main():
     # ── Validate runtime exists ──
     for path, label in [(runtime_c, 'bash_runtime.c'), (runtime_h, 'bash_runtime.h')]:
         if not os.path.isfile(path):
-            print(f"bash2c: error: runtime file '{label}' not found at {path}\n"
-                  f"  Expected layout: bash2c.py and runtime/ in the same directory.",
+            print(f"shellraiser: error: runtime file '{label}' not found at {path}\n"
+                  f"  Expected layout: shellraiser.py and runtime/ in the same directory.",
                   file=sys.stderr)
             sys.exit(1)
 
@@ -2677,7 +2744,7 @@ def main():
         c_path = os.path.splitext(os.path.abspath(args.script))[0] + '.c'
     else:
         # Use a temp file that we'll clean up
-        tmp_fd, c_path = tempfile.mkstemp(suffix='.c', prefix='bash2c_')
+        tmp_fd, c_path = tempfile.mkstemp(suffix='.c', prefix='shellraiser_')
         os.close(tmp_fd)
 
     try:
@@ -2696,7 +2763,7 @@ def main():
         # Verify compiler is available
         cc_resolved = shutil.which(cc)
         if cc_resolved is None:
-            print(f"bash2c: error: compiler '{cc}' not found on PATH", file=sys.stderr)
+            print(f"shellraiser: error: compiler '{cc}' not found on PATH", file=sys.stderr)
             sys.exit(1)
 
         # ── Build compiler flags ──
@@ -2741,7 +2808,7 @@ def main():
                 stderr_lines.append(line)
             if stderr_lines:
                 print('\n'.join(stderr_lines), file=sys.stderr)
-            print(f"bash2c: compilation failed (exit {result.returncode})", file=sys.stderr)
+            print(f"shellraiser: compilation failed (exit {result.returncode})", file=sys.stderr)
             sys.exit(1)
 
         # Print non-fatal warnings (excluding noisy ones)
@@ -2769,7 +2836,7 @@ def main():
         # ── chmod +x ──
         os.chmod(out_bin, 0o755)
 
-        print(f"bash2c: compiled → {out_bin}", file=sys.stderr)
+        print(f"shellraiser: compiled → {out_bin}", file=sys.stderr)
 
     finally:
         # ── Cleanup intermediate .c if not saving ──

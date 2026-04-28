@@ -3,10 +3,16 @@
 #include "bash_runtime.h"
 #include <sys/stat.h>
 #include <signal.h>
+#include <limits.h>
+#include <dirent.h>
+#include <regex.h>
 
 extern char **environ;
 
 BashRuntime rt;
+
+/* forward declarations */
+static int try_bash_env_func(const char *name, char **argv);
 
 /* ================================================================
  *  Dynamic String (BStr)
@@ -80,7 +86,23 @@ static unsigned int hash_name(const char *s) {
 
 void rt_init(int argc, char **argv) {
     memset(&rt, 0, sizeof(rt));
-    rt.script_arg0 = argv[0] ? strdup(argv[0]) : strdup("bash2c");
+    rt.script_arg0 = argv[0] ? strdup(argv[0]) : strdup("shellraiser");
+
+    /* Resolve our own absolute path for function export shims */
+    rt.self_path = NULL;
+#ifdef __linux__
+    {
+        char buf[PATH_MAX];
+        ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (len > 0) { buf[len] = '\0'; rt.self_path = strdup(buf); }
+    }
+#endif
+    if (!rt.self_path && argv[0]) {
+        char *rp = realpath(argv[0], NULL);
+        if (rp) rt.self_path = rp;
+        else rt.self_path = strdup(argv[0]);
+    }
+    if (!rt.self_path) rt.self_path = strdup("shellraiser");
 
     /* push initial argument frame (the script args) */
     rt.arg_stack[0].argc = argc > 0 ? argc - 1 : 0;
@@ -126,6 +148,24 @@ void rt_cleanup(void) {
         rt.arrays[i] = NULL;
     }
     free(rt.script_arg0);
+    free(rt.self_path);
+
+    /* Remove shim directory and all shim scripts */
+    if (rt.shim_dir) {
+        DIR *d = opendir(rt.shim_dir);
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d))) {
+                if (ent->d_name[0] == '.') continue;
+                char path[PATH_MAX];
+                snprintf(path, sizeof(path), "%s/%s", rt.shim_dir, ent->d_name);
+                unlink(path);
+            }
+            closedir(d);
+        }
+        rmdir(rt.shim_dir);
+        free(rt.shim_dir);
+    }
 }
 
 void rt_import_env(void) {
@@ -282,7 +322,7 @@ void rt_set_local(const char *name, const char *value) {
 
 void rt_push_args(int argc, char **argv) {
     if (rt.arg_depth + 1 >= MAX_ARG_DEPTH) {
-        fprintf(stderr, "bash2c: argument stack overflow\n");
+        fprintf(stderr, "shellraiser: argument stack overflow\n");
         exit(2);
     }
     rt.arg_depth++;
@@ -382,7 +422,7 @@ static char *find_in_path(const char *cmd) {
 }
 
 int rt_exec_simple(char **argv) {
-    if (!argv || !argv[0]) { rt.last_exit = 0; return 0; }
+    if (!argv || !argv[0] || !argv[0][0]) { rt.last_exit = 0; return 0; }
 
     /* check builtins first */
     BuiltinFunc bf = rt_find_builtin(argv[0]);
@@ -390,6 +430,15 @@ int rt_exec_simple(char **argv) {
         int argc = 0;
         while (argv[argc]) argc++;
         rt.last_exit = bf(argc, argv);
+        return rt.last_exit;
+    }
+
+    /* check compiled function table (for dynamic invocations) */
+    BashFuncPtr fn = rt_find_func(argv[0]);
+    if (fn) {
+        int argc = 0;
+        while (argv[argc]) argc++;
+        rt.last_exit = fn(argc, argv);
         return rt.last_exit;
     }
 
@@ -401,6 +450,10 @@ int rt_exec_simple(char **argv) {
     if (pid == 0) {
         /* child */
         execvp(argv[0], argv);
+        /* execvp failed — try bash-exported function from environment */
+        /* (this runs in the child, so we can just _exit after) */
+        int r = try_bash_env_func(argv[0], argv);
+        if (r >= 0) _exit(r);
         fprintf(stderr, "%s: command not found\n", argv[0]);
         _exit(127);
     }
@@ -467,7 +520,7 @@ int rt_exec_redir(char **argv,
                   const char *out_file, int out_append,
                   const char *err_file, int err_append)
 {
-    if (!argv || !argv[0]) { rt.last_exit = 0; return 0; }
+    if (!argv || !argv[0] || !argv[0][0]) { rt.last_exit = 0; return 0; }
 
     /* builtins with redirection – handle via temporary fd swapping */
     BuiltinFunc bf = rt_find_builtin(argv[0]);
@@ -683,7 +736,7 @@ static long arith_primary(ArithCtx *ctx) {
         ctx->pos++;
         return ~arith_primary(ctx);
     }
-    if (c == '-' && !(isdigit((unsigned char)ctx->src[ctx->pos + 1]) == 0)) {
+    if (c == '-' && (!isdigit((unsigned char)ctx->src[ctx->pos + 1])) == 0) {
         /* could be unary minus */
         /* always treat as unary minus */
     }
@@ -1151,7 +1204,7 @@ void rt_split_free(char **words, int count) {
  * ================================================================ */
 
 int rt_exec_background(char **argv) {
-    if (!argv || !argv[0]) { return 0; }
+    if (!argv || !argv[0] || !argv[0][0]) { return 0; }
 
     /* reap any finished background children to prevent zombie build-up */
     while (waitpid(-1, NULL, WNOHANG) > 0) {}
@@ -1177,7 +1230,7 @@ int rt_exec_background_redir(char **argv,
                               const char *out_file, int out_append,
                               const char *err_file, int err_append)
 {
-    if (!argv || !argv[0]) { return 0; }
+    if (!argv || !argv[0] || !argv[0][0]) { return 0; }
 
     rt_sync_env();
 
@@ -1194,6 +1247,130 @@ int rt_exec_background_redir(char **argv,
     rt.last_bg_pid = pid;
     rt.last_exit = 0;
     return 0;
+}
+
+/* ================================================================
+ *  Function Export (compiled functions callable from child shells)
+ * ================================================================ */
+
+void rt_register_functions(FuncEntry *table, int count) {
+    rt.func_table = table;
+    rt.func_count = count;
+}
+
+BashFuncPtr rt_find_func(const char *name) {
+    if (!rt.func_table) return NULL;
+    for (int i = 0; i < rt.func_count; i++) {
+        if (strcmp(rt.func_table[i].name, name) == 0)
+            return rt.func_table[i].func;
+    }
+    return NULL;
+}
+
+int rt_dispatch_call(const char *name, int argc, char **argv) {
+    BashFuncPtr fn = rt_find_func(name);
+    if (!fn) {
+        fprintf(stderr, "shellraiser: function '%s' not found\n", name);
+        return 127;
+    }
+    return fn(argc, argv);
+}
+
+static void ensure_shim_dir(void) {
+    if (rt.shim_dir) return;
+
+    char tpl[256];
+    snprintf(tpl, sizeof(tpl), "/tmp/shellraiser_shims_%d_XXXXXX", (int)getpid());
+    char *dir = mkdtemp(tpl);
+    if (!dir) {
+        perror("shellraiser: mkdtemp");
+        return;
+    }
+    rt.shim_dir = strdup(dir);
+
+    /* Prepend shim_dir to PATH so child processes find our shims */
+    const char *old_path = getenv("PATH");
+    if (old_path) {
+        size_t len = strlen(rt.shim_dir) + 1 + strlen(old_path) + 1;
+        char *new_path = (char *)malloc(len);
+        snprintf(new_path, len, "%s:%s", rt.shim_dir, old_path);
+        setenv("PATH", new_path, 1);
+        rt_set_var("PATH", new_path);
+        free(new_path);
+    } else {
+        setenv("PATH", rt.shim_dir, 1);
+        rt_set_var("PATH", rt.shim_dir);
+    }
+}
+
+void rt_export_func(const char *name) {
+    /* Verify function exists in our table */
+    if (!rt_find_func(name)) {
+        fprintf(stderr, "shellraiser: export -f: function '%s' not found\n", name);
+        return;
+    }
+
+    ensure_shim_dir();
+    if (!rt.shim_dir) return;
+
+    /* Create shim script: #!/bin/sh\nexec /path/to/binary --call funcname "$@" */
+    char shim_path[PATH_MAX];
+    snprintf(shim_path, sizeof(shim_path), "%s/%s", rt.shim_dir, name);
+
+    FILE *f = fopen(shim_path, "w");
+    if (!f) {
+        perror(shim_path);
+        return;
+    }
+    fprintf(f, "#!/bin/sh\nexec '%s' --call '%s' \"$@\"\n", rt.self_path, name);
+    fclose(f);
+    chmod(shim_path, 0755);
+}
+
+/* Try to call a bash function from the environment.
+ * Bash exports functions as BASH_FUNC_name%% environment variables.
+ * We invoke bash to evaluate the function definition and call it. */
+static int try_bash_env_func(const char *name, char **argv) {
+    /* Look for BASH_FUNC_name%% in environment */
+    char env_key[256];
+    snprintf(env_key, sizeof(env_key), "BASH_FUNC_%s%%%%", name);
+
+    const char *func_body = getenv(env_key);
+    if (!func_body) return -1;  /* not found */
+
+    /* Build: bash -c 'eval "$1"; funcname "${@:2}"' -- "$func_body" arg1 arg2... */
+    int orig_argc = 0;
+    while (argv[orig_argc]) orig_argc++;
+
+    /* We need: bash -c '...' -- func_body [original args starting from argv[1]] */
+    int new_argc = 4 + (orig_argc > 0 ? orig_argc - 1 : 0) + 1 + 1;
+    char **new_argv = (char **)calloc((size_t)new_argc, sizeof(char *));
+
+    /* Build the -c script: it receives func_body as $1, then original args as $2.. */
+    char script[512];
+    snprintf(script, sizeof(script),
+             "eval \"$1\"; %s \"${@:2}\"", name);
+
+    int i = 0;
+    new_argv[i++] = (char *)"bash";
+    new_argv[i++] = (char *)"-c";
+    new_argv[i++] = script;
+    new_argv[i++] = (char *)"--";
+    new_argv[i++] = (char *)func_body;
+    for (int j = 1; j < orig_argc; j++)
+        new_argv[i++] = argv[j];
+    new_argv[i] = NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) { free(new_argv); return -1; }
+    if (pid == 0) {
+        execvp("bash", new_argv);
+        _exit(127);
+    }
+    free(new_argv);
+    int status;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128;
 }
 
 /* ================================================================
@@ -1301,7 +1478,7 @@ int rt_builtin_printf_cmd(int argc, char **argv) {
     FILE *out = stdout;
     char *tmpfile_path = NULL;
     if (var_name) {
-        tmpfile_path = strdup("/tmp/.bash2c_printf_XXXXXX");
+        tmpfile_path = strdup("/tmp/.shellraiser_printf_XXXXXX");
         int tfd = mkstemp(tmpfile_path);
         if (tfd >= 0) {
             out = fdopen(tfd, "w+");
@@ -1518,18 +1695,31 @@ int rt_builtin_read(int argc, char **argv) {
 }
 
 int rt_builtin_export(int argc, char **argv) {
-    for (int i = 1; i < argc; i++) {
-        char *eq = strchr(argv[i], '=');
-        if (eq) {
-            size_t nlen = (size_t)(eq - argv[i]);
-            char *name = (char *)malloc(nlen + 1);
-            memcpy(name, argv[i], nlen);
-            name[nlen] = '\0';
-            rt_set_var(name, eq + 1);
-            rt_export_var(name);
-            free(name);
+    int func_mode = 0;
+    int start = 1;
+
+    /* check for -f flag */
+    if (argc > 1 && strcmp(argv[1], "-f") == 0) {
+        func_mode = 1;
+        start = 2;
+    }
+
+    for (int i = start; i < argc; i++) {
+        if (func_mode) {
+            rt_export_func(argv[i]);
         } else {
-            rt_export_var(argv[i]);
+            char *eq = strchr(argv[i], '=');
+            if (eq) {
+                size_t nlen = (size_t)(eq - argv[i]);
+                char *name = (char *)malloc(nlen + 1);
+                memcpy(name, argv[i], nlen);
+                name[nlen] = '\0';
+                rt_set_var(name, eq + 1);
+                rt_export_var(name);
+                free(name);
+            } else {
+                rt_export_var(argv[i]);
+            }
         }
     }
     return 0;
@@ -1725,6 +1915,291 @@ int rt_builtin_unset_cmd(int argc, char **argv) {
     return 0;
 }
 
+/* [[ extended test builtin.
+ * Supports the same operators as [ / test, plus:
+ *   &&, || as logical connectives (instead of -a, -o)
+ *   =~  for regex matching (delegates to regex)
+ *   Pattern matching with == (using fnmatch)
+ * Arguments end at ]] */
+static int dblbracket_expr(int argc, char **argv, int *pos);
+
+static int dblbracket_primary(int argc, char **argv, int *pos) {
+    if (*pos >= argc) return 0;
+    const char *tok = argv[*pos];
+    if (strcmp(tok, "]]") == 0) return 0;
+
+    /* ! expr */
+    if (strcmp(tok, "!") == 0) {
+        (*pos)++;
+        return !dblbracket_primary(argc, argv, pos);
+    }
+    /* ( expr ) */
+    if (strcmp(tok, "(") == 0) {
+        (*pos)++;
+        int v = dblbracket_expr(argc, argv, pos);
+        if (*pos < argc && strcmp(argv[*pos], ")") == 0) (*pos)++;
+        return v;
+    }
+    /* unary: -n, -z, -e, -f, -d, -r, -w, -x, -s, -L, -h */
+    if (tok[0] == '-' && strlen(tok) == 2 && *pos + 1 < argc
+            && strcmp(argv[*pos + 1], "]]") != 0) {
+        char op = tok[1];
+        /* check if next token is a binary operator — if so, this is a string operand */
+        if (*pos + 2 < argc) {
+            const char *maybe_op = argv[*pos + 1];
+            if (strcmp(maybe_op, "=") == 0 || strcmp(maybe_op, "==") == 0 ||
+                strcmp(maybe_op, "!=") == 0 || strcmp(maybe_op, "=~") == 0 ||
+                strcmp(maybe_op, "-eq") == 0 || strcmp(maybe_op, "-ne") == 0 ||
+                strcmp(maybe_op, "-lt") == 0 || strcmp(maybe_op, "-le") == 0 ||
+                strcmp(maybe_op, "-gt") == 0 || strcmp(maybe_op, "-ge") == 0 ||
+                strcmp(maybe_op, "<") == 0 || strcmp(maybe_op, ">") == 0) {
+                goto binary_check;
+            }
+        }
+        const char *arg = argv[*pos + 1];
+        *pos += 2;
+        switch (op) {
+            case 'n': return strlen(arg) > 0;
+            case 'z': return strlen(arg) == 0;
+            case 'e': return access(arg, F_OK) == 0;
+            case 'f': { struct stat st; return stat(arg, &st) == 0 && S_ISREG(st.st_mode); }
+            case 'd': { struct stat st; return stat(arg, &st) == 0 && S_ISDIR(st.st_mode); }
+            case 'r': return access(arg, R_OK) == 0;
+            case 'w': return access(arg, W_OK) == 0;
+            case 'x': return access(arg, X_OK) == 0;
+            case 's': { struct stat st; return stat(arg, &st) == 0 && st.st_size > 0; }
+            case 'L': case 'h': { struct stat st; return lstat(arg, &st) == 0 && S_ISLNK(st.st_mode); }
+            case 'v': return strlen(rt_get_var(arg)) > 0; /* -v var: variable is set */
+        }
+    }
+
+binary_check:
+    /* binary operators */
+    if (*pos + 2 < argc && strcmp(argv[*pos + 1], "]]") != 0) {
+        const char *left = argv[*pos];
+        const char *op   = argv[*pos + 1];
+        const char *right = argv[*pos + 2];
+
+        if (strcmp(op, "=") == 0 || strcmp(op, "==") == 0) {
+            *pos += 3;
+            return fnmatch(right, left, 0) == 0; /* == does pattern match in [[ ]] */
+        }
+        if (strcmp(op, "!=") == 0) {
+            *pos += 3; return fnmatch(right, left, 0) != 0;
+        }
+        if (strcmp(op, "=~") == 0) {
+            *pos += 3;
+            regex_t reg;
+            if (regcomp(&reg, right, REG_EXTENDED | REG_NOSUB) != 0) return 0;
+            int m = regexec(&reg, left, 0, NULL, 0) == 0;
+            regfree(&reg);
+            return m;
+        }
+        if (strcmp(op, "<") == 0) { *pos += 3; return strcmp(left, right) < 0; }
+        if (strcmp(op, ">") == 0) { *pos += 3; return strcmp(left, right) > 0; }
+        if (strcmp(op, "-eq") == 0) { *pos += 3; return strtol(left,NULL,10) == strtol(right,NULL,10); }
+        if (strcmp(op, "-ne") == 0) { *pos += 3; return strtol(left,NULL,10) != strtol(right,NULL,10); }
+        if (strcmp(op, "-lt") == 0) { *pos += 3; return strtol(left,NULL,10) < strtol(right,NULL,10); }
+        if (strcmp(op, "-le") == 0) { *pos += 3; return strtol(left,NULL,10) <= strtol(right,NULL,10); }
+        if (strcmp(op, "-gt") == 0) { *pos += 3; return strtol(left,NULL,10) > strtol(right,NULL,10); }
+        if (strcmp(op, "-ge") == 0) { *pos += 3; return strtol(left,NULL,10) >= strtol(right,NULL,10); }
+    }
+
+    /* single string: true if non-empty */
+    {
+        int v = strlen(argv[*pos]) > 0;
+        (*pos)++;
+        return v;
+    }
+}
+
+static int dblbracket_and(int argc, char **argv, int *pos) {
+    int v = dblbracket_primary(argc, argv, pos);
+    while (*pos < argc && strcmp(argv[*pos], "&&") == 0) {
+        (*pos)++;
+        int r = dblbracket_primary(argc, argv, pos);
+        v = v && r;
+    }
+    return v;
+}
+
+static int dblbracket_expr(int argc, char **argv, int *pos) {
+    int v = dblbracket_and(argc, argv, pos);
+    while (*pos < argc && strcmp(argv[*pos], "||") == 0) {
+        (*pos)++;
+        int r = dblbracket_and(argc, argv, pos);
+        v = v || r;
+    }
+    return v;
+}
+
+int rt_builtin_dblbracket(int argc, char **argv) {
+    /* strip trailing ]] */
+    int end = argc;
+    if (end > 1 && strcmp(argv[end - 1], "]]") == 0) end--;
+    if (end <= 1) return 1; /* empty = false */
+
+    int pos = 1;
+    int result = dblbracket_expr(end, argv, &pos);
+    return result ? 0 : 1;
+}
+
+/* declare builtin: declare [-aAirx] [name[=value] ...] */
+int rt_builtin_declare_cmd(int argc, char **argv) {
+    int flag_a = 0;     /* -a: indexed array */
+    int flag_x = 0;     /* -x: export */
+    int flag_i = 0;     /* -i: integer (we just set as string) */
+    int flag_g = 0;     /* -g: global scope */
+    int flag_r = 0;     /* -r: readonly (ignored for now) */
+
+    int i = 1;
+    /* parse flags */
+    while (i < argc && argv[i][0] == '-' && argv[i][1]) {
+        for (const char *f = argv[i] + 1; *f; f++) {
+            switch (*f) {
+                case 'a': flag_a = 1; break;
+                case 'A': flag_a = 1; break;  /* associative → treat as indexed */
+                case 'i': flag_i = 1; break;
+                case 'x': flag_x = 1; break;
+                case 'g': flag_g = 1; break;
+                case 'r': flag_r = 1; break;
+                case '-': break; /* -- end of flags */
+                default: break;
+            }
+        }
+        i++;
+    }
+
+    (void)flag_i; (void)flag_r; /* acknowledged but not enforced */
+
+    for (; i < argc; i++) {
+        char *eq = strchr(argv[i], '=');
+        char *name;
+        const char *value;
+        if (eq) {
+            size_t nlen = (size_t)(eq - argv[i]);
+            name = (char *)malloc(nlen + 1);
+            memcpy(name, argv[i], nlen);
+            name[nlen] = '\0';
+            value = eq + 1;
+        } else {
+            name = strdup(argv[i]);
+            value = "";
+        }
+
+        if (flag_a) {
+            /* declare -a name — just ensure array exists */
+            /* if value given, it's not in (...) form from here, just set scalar */
+            if (eq) {
+                rt_set_var(name, value);
+            }
+            /* array creation happens implicitly on first array op */
+        } else if (flag_g) {
+            rt_set_var(name, value);
+        } else {
+            /* in function scope, use local */
+            if (rt.scope_depth > 0) {
+                rt_set_local(name, value);
+            } else {
+                rt_set_var(name, value);
+            }
+        }
+        if (flag_x) rt_export_var(name);
+        free(name);
+    }
+    return 0;
+}
+
+/* trap builtin: trap [action] [signal ...]
+ * Basic support: handles common signals and EXIT trap. */
+static char *trap_exit_cmd = NULL;
+
+static void trap_atexit_handler(void) {
+    if (trap_exit_cmd && *trap_exit_cmd) {
+        /* Execute the EXIT trap command via shell */
+        int _unused = system(trap_exit_cmd);
+        (void)_unused;
+    }
+    free(trap_exit_cmd);
+    trap_exit_cmd = NULL;
+}
+
+static void trap_signal_handler(int sig) {
+    (void)sig;
+    /* For simple signal traps, we just record that a signal was received.
+     * Full trap support would require storing per-signal commands. */
+}
+
+int rt_builtin_trap_cmd(int argc, char **argv) {
+    if (argc < 2) return 0;
+
+    /* trap '' SIGNAL — ignore signal */
+    /* trap - SIGNAL — reset to default */
+    /* trap 'command' SIGNAL [...] */
+
+    const char *action = argv[1];
+    int sig_start = 2;
+
+    /* trap -l: list signals (not implemented, just return) */
+    if (strcmp(action, "-l") == 0) return 0;
+
+    /* If only one arg, it might be a signal name (reset) */
+    if (argc == 2) return 0;
+
+    for (int i = sig_start; i < argc; i++) {
+        const char *signame = argv[i];
+
+        /* EXIT / 0 trap */
+        if (strcmp(signame, "EXIT") == 0 || strcmp(signame, "0") == 0) {
+            free(trap_exit_cmd);
+            if (strcmp(action, "-") == 0 || strcmp(action, "") == 0) {
+                trap_exit_cmd = NULL;
+            } else {
+                trap_exit_cmd = strdup(action);
+                static int atexit_registered = 0;
+                if (!atexit_registered) {
+                    atexit(trap_atexit_handler);
+                    atexit_registered = 1;
+                }
+            }
+            continue;
+        }
+
+        /* Map signal names to numbers */
+        int signum = 0;
+        if (strcmp(signame, "INT") == 0 || strcmp(signame, "SIGINT") == 0 || strcmp(signame, "2") == 0)
+            signum = SIGINT;
+        else if (strcmp(signame, "TERM") == 0 || strcmp(signame, "SIGTERM") == 0 || strcmp(signame, "15") == 0)
+            signum = SIGTERM;
+        else if (strcmp(signame, "HUP") == 0 || strcmp(signame, "SIGHUP") == 0 || strcmp(signame, "1") == 0)
+            signum = SIGHUP;
+        else if (strcmp(signame, "USR1") == 0 || strcmp(signame, "SIGUSR1") == 0)
+            signum = SIGUSR1;
+        else if (strcmp(signame, "USR2") == 0 || strcmp(signame, "SIGUSR2") == 0)
+            signum = SIGUSR2;
+        else if (strcmp(signame, "PIPE") == 0 || strcmp(signame, "SIGPIPE") == 0)
+            signum = SIGPIPE;
+        else {
+            /* try numeric */
+            char *end;
+            long n = strtol(signame, &end, 10);
+            if (*end == '\0' && n > 0 && n < 64) signum = (int)n;
+        }
+
+        if (signum == 0) continue;
+
+        if (strcmp(action, "-") == 0) {
+            signal(signum, SIG_DFL);
+        } else if (strcmp(action, "") == 0) {
+            signal(signum, SIG_IGN);
+        } else {
+            /* For non-EXIT traps, just install a basic handler */
+            signal(signum, trap_signal_handler);
+        }
+    }
+    return 0;
+}
+
 /* ======================== Builtin Lookup Table ======================== */
 
 typedef struct {
@@ -1741,6 +2216,7 @@ static const BuiltinEntry builtins[] = {
     { "export",  rt_builtin_export     },
     { "test",    rt_builtin_test       },
     { "[",       rt_builtin_test       },
+    { "[[",      rt_builtin_dblbracket },
     { "true",    rt_builtin_true_cmd   },
     { "false",   rt_builtin_false_cmd  },
     { "return",  rt_builtin_return_cmd },
@@ -1748,6 +2224,9 @@ static const BuiltinEntry builtins[] = {
     { "shift",   rt_builtin_shift_cmd  },
     { "wait",    rt_builtin_wait_cmd   },
     { "unset",   rt_builtin_unset_cmd  },
+    { "declare", rt_builtin_declare_cmd },
+    { "typeset", rt_builtin_declare_cmd },
+    { "trap",    rt_builtin_trap_cmd   },
     { ":",       rt_builtin_true_cmd   }, /* colon = noop */
     { NULL, NULL }
 };

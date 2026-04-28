@@ -1,5 +1,6 @@
 #ifndef BASH_RUNTIME_H
 #define BASH_RUNTIME_H
+#define _DARWIN_C_SOURCE
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,6 +59,16 @@ typedef struct ArrayEntry {
 } ArrayEntry;
 
 /* ======================== Runtime State ======================== */
+
+/* Function pointer type for compiled bash functions */
+typedef int (*BashFuncPtr)(int argc, char **argv);
+
+/* Registered function entry for --call dispatch */
+typedef struct {
+    const char  *name;
+    BashFuncPtr  func;
+} FuncEntry;
+
 typedef struct {
     VarEntry   *vars[VAR_HASH_SIZE];
     ArrayEntry *arrays[VAR_HASH_SIZE];
@@ -68,6 +79,10 @@ typedef struct {
     int       func_returning;   /* set by 'return' builtin */
     char     *script_arg0;      /* $0 – the script name */
     pid_t     last_bg_pid;      /* $! – last backgrounded PID */
+    char     *self_path;        /* absolute path to this binary */
+    char     *shim_dir;         /* temp dir for exported function shims */
+    FuncEntry *func_table;      /* NULL-terminated array; set by generated main() */
+    int        func_count;
 } BashRuntime;
 
 extern BashRuntime rt;
@@ -75,6 +90,12 @@ extern BashRuntime rt;
 /* ======================== Init / Cleanup ======================== */
 void rt_init(int argc, char **argv);
 void rt_cleanup(void);
+
+/* ======================== Function Export ======================== */
+void rt_register_functions(FuncEntry *table, int count);
+void rt_export_func(const char *name);          /* create PATH shim for function */
+BashFuncPtr rt_find_func(const char *name);     /* lookup compiled function by name */
+int  rt_dispatch_call(const char *name, int argc, char **argv);  /* --call handler */
 
 /* ======================== Variables ======================== */
 void        rt_set_var(const char *name, const char *value);
