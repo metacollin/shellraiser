@@ -1464,6 +1464,7 @@ class CodeGen:
         remaining = [s for s in stmts if not isinstance(s, FunctionDef)]
 
         header = [
+            '#define _POSIX_C_SOURCE 200809L',
             '#include "bash_runtime.h"',
             '#include <string.h>',
             '',
@@ -2605,7 +2606,7 @@ class CodeGen:
         elif name == '$':
             return 'rt_itoa((long)getpid())'
         elif name == '!':
-            return 'rt_itoa((long)rt.last_bg_pid)'
+            return '(rt.last_bg_pid > 0 ? rt_itoa((long)rt.last_bg_pid) : rt_strdup_safe(""))'
         elif name == '-':
             return '""'  # simplified
         elif name == '0':

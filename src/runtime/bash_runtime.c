@@ -736,7 +736,7 @@ static long arith_primary(ArithCtx *ctx) {
         ctx->pos++;
         return ~arith_primary(ctx);
     }
-    if (c == '-' && (!isdigit((unsigned char)ctx->src[ctx->pos + 1])) == 0) {
+    if (c == '-' && !isdigit((unsigned char)ctx->src[ctx->pos + 1]) == 0) {
         /* could be unary minus */
         /* always treat as unary minus */
     }
@@ -2200,6 +2200,99 @@ int rt_builtin_trap_cmd(int argc, char **argv) {
     return 0;
 }
 
+/* kill builtin: kill [-signal] pid ... */
+int rt_builtin_kill_cmd(int argc, char **argv) {
+    int sig = SIGTERM;
+    int start = 1;
+
+    if (argc > 1 && argv[1][0] == '-') {
+        const char *sigarg = argv[1] + 1;
+        /* numeric signal */
+        if (isdigit((unsigned char)sigarg[0])) {
+            sig = (int)strtol(sigarg, NULL, 10);
+        } else if (strcmp(sigarg, "INT") == 0 || strcmp(sigarg, "SIGINT") == 0) {
+            sig = SIGINT;
+        } else if (strcmp(sigarg, "TERM") == 0 || strcmp(sigarg, "SIGTERM") == 0) {
+            sig = SIGTERM;
+        } else if (strcmp(sigarg, "KILL") == 0 || strcmp(sigarg, "SIGKILL") == 0) {
+            sig = SIGKILL;
+        } else if (strcmp(sigarg, "HUP") == 0 || strcmp(sigarg, "SIGHUP") == 0) {
+            sig = SIGHUP;
+        } else if (strcmp(sigarg, "USR1") == 0) { sig = SIGUSR1;
+        } else if (strcmp(sigarg, "USR2") == 0) { sig = SIGUSR2;
+        } else if (strcmp(sigarg, "0") == 0) { sig = 0;
+        }
+        start = 2;
+    }
+
+    int ret = 0;
+    for (int i = start; i < argc; i++) {
+        if (!argv[i][0]) continue;  /* skip empty args */
+        pid_t pid = (pid_t)strtol(argv[i], NULL, 10);
+        if (pid == 0 && argv[i][0] != '0') {
+            fprintf(stderr, "kill: invalid pid: %s\n", argv[i]);
+            ret = 1;
+            continue;
+        }
+        if (kill(pid, sig) < 0) {
+            fprintf(stderr, "kill: (%ld) - %s\n", (long)pid, strerror(errno));
+            ret = 1;
+        }
+    }
+    return ret;
+}
+
+/* command builtin: command [-v] name [args...]
+ * command name args... — bypass functions, run external command
+ * command -v name — print path of command (like which) */
+int rt_builtin_command_cmd(int argc, char **argv) {
+    if (argc < 2) return 1;
+
+    if (strcmp(argv[1], "-v") == 0) {
+        /* command -v: print the path or type */
+        if (argc < 3) return 1;
+        const char *name = argv[2];
+
+        /* check builtins */
+        if (rt_find_builtin(name)) {
+            printf("%s\n", name);
+            return 0;
+        }
+        /* search PATH */
+        const char *path = getenv("PATH");
+        if (!path) path = "/usr/bin:/bin";
+        char *p = strdup(path);
+        char *dir = strtok(p, ":");
+        while (dir) {
+            char buf[4096];
+            snprintf(buf, sizeof(buf), "%s/%s", dir, name);
+            if (access(buf, X_OK) == 0) {
+                printf("%s\n", buf);
+                free(p);
+                return 0;
+            }
+            dir = strtok(NULL, ":");
+        }
+        free(p);
+        return 1;  /* not found */
+    }
+
+    /* command name args... — run bypassing functions */
+    /* shift argv to remove "command" */
+    rt_sync_env();
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return 127; }
+    if (pid == 0) {
+        execvp(argv[1], argv + 1);
+        fprintf(stderr, "%s: command not found\n", argv[1]);
+        _exit(127);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    rt.last_exit = WIFEXITED(status) ? WEXITSTATUS(status) : 128;
+    return rt.last_exit;
+}
+
 /* ======================== Builtin Lookup Table ======================== */
 
 typedef struct {
@@ -2227,6 +2320,8 @@ static const BuiltinEntry builtins[] = {
     { "declare", rt_builtin_declare_cmd },
     { "typeset", rt_builtin_declare_cmd },
     { "trap",    rt_builtin_trap_cmd   },
+    { "kill",    rt_builtin_kill_cmd   },
+    { "command", rt_builtin_command_cmd },
     { ":",       rt_builtin_true_cmd   }, /* colon = noop */
     { NULL, NULL }
 };
