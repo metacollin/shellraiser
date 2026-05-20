@@ -110,7 +110,7 @@ void rt_init(int argc, char **argv) {
     rt.arg_stack[0].offset = 0;
     rt.arg_depth = 0;
 
-    /* Set up SIGCHLD handler — use SA_RESTART so syscalls aren't
+    /* Set up SIGCHLD handler - use SA_RESTART so syscalls aren't
      * interrupted by child exits.  We do NOT use SA_NOCLDWAIT because
      * that would auto-reap children before wait() can collect them. */
     struct sigaction sa;
@@ -146,6 +146,20 @@ void rt_cleanup(void) {
             a = next;
         }
         rt.arrays[i] = NULL;
+    }
+    for (int i = 0; i < VAR_HASH_SIZE; i++) {
+        AssocArray *a = rt.assocs[i];
+        while (a) {
+            AssocArray *next = a->next;
+            for (int j = 0; j < ASSOC_HASH_SIZE; j++) {
+                AssocItem *it = a->buckets[j];
+                while (it) { AssocItem *n = it->next; free(it->key); free(it->value); free(it); it = n; }
+            }
+            free(a->name);
+            free(a);
+            a = next;
+        }
+        rt.assocs[i] = NULL;
     }
     free(rt.script_arg0);
     free(rt.self_path);
@@ -450,7 +464,7 @@ int rt_exec_simple(char **argv) {
     if (pid == 0) {
         /* child */
         execvp(argv[0], argv);
-        /* execvp failed — try bash-exported function from environment */
+        /* execvp failed - try bash-exported function from environment */
         /* (this runs in the child, so we can just _exit after) */
         int r = try_bash_env_func(argv[0], argv);
         if (r >= 0) _exit(r);
@@ -522,7 +536,7 @@ int rt_exec_redir(char **argv,
 {
     if (!argv || !argv[0] || !argv[0][0]) { rt.last_exit = 0; return 0; }
 
-    /* builtins with redirection – handle via temporary fd swapping */
+    /* builtins with redirection - handle via temporary fd swapping */
     BuiltinFunc bf = rt_find_builtin(argv[0]);
     if (bf) {
         int saved_in  = apply_redir(STDIN_FILENO,  in_file,  0);
@@ -609,6 +623,63 @@ int rt_exec_pipeline_v(char ***cmds, int ncmds) {
     rt.last_exit = WIFEXITED(status) ? WEXITSTATUS(status) : 128;
     free(pids);
     return rt.last_exit;
+}
+
+/* Background variant: fork a supervisor that runs the whole pipeline,
+ * store its PID in $!, and return immediately. */
+int rt_exec_pipeline_bg(char ***cmds, int ncmds) {
+    if (ncmds == 0) return 0;
+    if (ncmds == 1) return rt_exec_background(cmds[0]);
+
+    /* reap stale children */
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+
+    rt_sync_env();
+
+    pid_t supervisor = fork();
+    if (supervisor < 0) { perror("fork"); return 1; }
+
+    if (supervisor == 0) {
+        /* child: run the pipeline and exit with its status */
+        int prev_fd = -1;
+        pid_t *pids = (pid_t *)calloc((size_t)ncmds, sizeof(pid_t));
+
+        for (int i = 0; i < ncmds; i++) {
+            int pipefd[2] = {-1, -1};
+            if (i < ncmds - 1) {
+                if (pipe(pipefd) < 0) _exit(1);
+            }
+            pid_t pid = fork();
+            if (pid < 0) _exit(1);
+            if (pid == 0) {
+                if (prev_fd >= 0) { dup2(prev_fd, STDIN_FILENO); close(prev_fd); }
+                if (pipefd[1] >= 0) { dup2(pipefd[1], STDOUT_FILENO); close(pipefd[1]); }
+                if (pipefd[0] >= 0) close(pipefd[0]);
+                BuiltinFunc bf = rt_find_builtin(cmds[i][0]);
+                if (bf) {
+                    int argc = 0;
+                    while (cmds[i][argc]) argc++;
+                    _exit(bf(argc, cmds[i]));
+                }
+                execvp(cmds[i][0], cmds[i]);
+                _exit(127);
+            }
+            pids[i] = pid;
+            if (prev_fd >= 0) close(prev_fd);
+            if (pipefd[1] >= 0) close(pipefd[1]);
+            prev_fd = pipefd[0];
+        }
+        int status;
+        for (int i = 0; i < ncmds; i++)
+            waitpid(pids[i], &status, 0);
+        free(pids);
+        _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 128);
+    }
+
+    /* parent: store supervisor PID as $! */
+    rt.last_bg_pid = supervisor;
+    rt.last_exit = 0;
+    return 0;
 }
 
 /* ================================================================
@@ -817,7 +888,7 @@ static long arith_primary(ArithCtx *ctx) {
         free(n);
         return v;
     }
-    /* unknown – return 0 */
+    /* unknown - return 0 */
     return 0;
 }
 
@@ -1144,9 +1215,136 @@ char **rt_array_get_all(const char *name, int *out_count) {
     char **result = (char **)malloc(sizeof(char *) * (size_t)count);
     int j = 0;
     for (int i = 0; i < a->len; i++)
-        if (a->elements[i]) result[j++] = a->elements[i]; /* NOT duped – caller must not free strings */
+        if (a->elements[i]) result[j++] = a->elements[i]; /* NOT duped - caller must not free strings */
     *out_count = count;
     return result;
+}
+
+/* ================================================================
+ *  Associative Arrays (declare -A)
+ * ================================================================ */
+
+static unsigned int assoc_hash_key(const char *s) {
+    unsigned int h = 5381;
+    while (*s) h = h * 33 + (unsigned char)*s++;
+    return h % ASSOC_HASH_SIZE;
+}
+
+static AssocArray *find_assoc(const char *name) {
+    unsigned int h = hash_name(name);
+    for (AssocArray *a = rt.assocs[h]; a; a = a->next)
+        if (strcmp(a->name, name) == 0) return a;
+    return NULL;
+}
+
+static AssocArray *ensure_assoc(const char *name) {
+    AssocArray *a = find_assoc(name);
+    if (a) return a;
+    unsigned int h = hash_name(name);
+    a = (AssocArray *)calloc(1, sizeof(AssocArray));
+    a->name = strdup(name);
+    a->next = rt.assocs[h];
+    rt.assocs[h] = a;
+    return a;
+}
+
+void rt_assoc_set(const char *name, const char *key, const char *value) {
+    AssocArray *a = ensure_assoc(name);
+    unsigned int h = assoc_hash_key(key);
+    /* check if key exists */
+    for (AssocItem *it = a->buckets[h]; it; it = it->next) {
+        if (strcmp(it->key, key) == 0) {
+            free(it->value);
+            it->value = strdup(value ? value : "");
+            return;
+        }
+    }
+    /* new key */
+    AssocItem *it = (AssocItem *)calloc(1, sizeof(AssocItem));
+    it->key   = strdup(key);
+    it->value = strdup(value ? value : "");
+    it->next  = a->buckets[h];
+    a->buckets[h] = it;
+    a->count++;
+}
+
+const char *rt_assoc_get(const char *name, const char *key) {
+    AssocArray *a = find_assoc(name);
+    if (!a) return "";
+    unsigned int h = assoc_hash_key(key);
+    for (AssocItem *it = a->buckets[h]; it; it = it->next)
+        if (strcmp(it->key, key) == 0) return it->value;
+    return "";
+}
+
+int rt_assoc_len(const char *name) {
+    AssocArray *a = find_assoc(name);
+    return a ? a->count : 0;
+}
+
+void rt_assoc_unset(const char *name) {
+    unsigned int h = hash_name(name);
+    AssocArray **pp = &rt.assocs[h];
+    while (*pp) {
+        if (strcmp((*pp)->name, name) == 0) {
+            AssocArray *a = *pp;
+            *pp = a->next;
+            for (int i = 0; i < ASSOC_HASH_SIZE; i++) {
+                AssocItem *it = a->buckets[i];
+                while (it) { AssocItem *n = it->next; free(it->key); free(it->value); free(it); it = n; }
+            }
+            free(a->name);
+            free(a);
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+void rt_assoc_unset_key(const char *name, const char *key) {
+    AssocArray *a = find_assoc(name);
+    if (!a) return;
+    unsigned int h = assoc_hash_key(key);
+    AssocItem **pp = &a->buckets[h];
+    while (*pp) {
+        if (strcmp((*pp)->key, key) == 0) {
+            AssocItem *it = *pp;
+            *pp = it->next;
+            free(it->key); free(it->value); free(it);
+            a->count--;
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+char **rt_assoc_keys(const char *name, int *out_count) {
+    AssocArray *a = find_assoc(name);
+    if (!a || a->count == 0) { *out_count = 0; return NULL; }
+    char **keys = (char **)malloc(sizeof(char *) * (size_t)a->count);
+    int j = 0;
+    for (int i = 0; i < ASSOC_HASH_SIZE; i++) {
+        for (AssocItem *it = a->buckets[i]; it; it = it->next)
+            keys[j++] = strdup(it->key);
+    }
+    *out_count = j;
+    return keys;
+}
+
+char *rt_assoc_join_values(const char *name, const char *sep) {
+    AssocArray *a = find_assoc(name);
+    BStr s = bstr_new();
+    if (a) {
+        int first = 1;
+        for (int i = 0; i < ASSOC_HASH_SIZE; i++) {
+            for (AssocItem *it = a->buckets[i]; it; it = it->next) {
+                if (!first) bstr_append(&s, sep);
+                bstr_append(&s, it->value);
+                first = 0;
+            }
+        }
+    }
+    return bstr_release(&s);
 }
 
 /* ================================================================
@@ -1214,12 +1412,12 @@ int rt_exec_background(char **argv) {
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); return 1; }
     if (pid == 0) {
-        /* child – exec immediately */
+        /* child - exec immediately */
         execvp(argv[0], argv);
         fprintf(stderr, "%s: command not found\n", argv[0]);
         _exit(127);
     }
-    /* parent – record PID, don't wait */
+    /* parent - record PID, don't wait */
     rt.last_bg_pid = pid;
     rt.last_exit = 0;
     return 0;
@@ -1485,7 +1683,12 @@ int rt_builtin_printf_cmd(int argc, char **argv) {
         }
     }
 
-    for (const char *p = fmt; *p; p++) {
+    /* Process format string - repeat for remaining args (bash behavior:
+     * printf "%s\n" a b c  prints all three, not just the first) */
+    int ai_start;
+    do {
+        ai_start = ai;  /* track if any args consumed this pass */
+        for (const char *p = fmt; *p; p++) {
         if (*p == '\\') {
             p++;
             switch (*p) {
@@ -1589,14 +1792,15 @@ int rt_builtin_printf_cmd(int argc, char **argv) {
                 const char *arg = ai < argc ? argv[ai++] : "";
                 fputc(arg[0] ? arg[0] : '\0', out);
             } else {
-                /* unknown — pass through */
+                /* unknown - pass through */
                 spec[si++] = type; spec[si] = '\0';
                 fputs(spec, out);
             }
         } else {
             fputc(*p, out);
         }
-    }
+        }  /* end for loop over format chars */
+    } while (ai < argc && ai > ai_start);  /* repeat format for remaining args */
 
     if (var_name && out != stdout) {
         fflush(out);
@@ -1944,7 +2148,7 @@ static int dblbracket_primary(int argc, char **argv, int *pos) {
     if (tok[0] == '-' && strlen(tok) == 2 && *pos + 1 < argc
             && strcmp(argv[*pos + 1], "]]") != 0) {
         char op = tok[1];
-        /* check if next token is a binary operator — if so, this is a string operand */
+        /* check if next token is a binary operator - if so, this is a string operand */
         if (*pos + 2 < argc) {
             const char *maybe_op = argv[*pos + 1];
             if (strcmp(maybe_op, "=") == 0 || strcmp(maybe_op, "==") == 0 ||
@@ -2058,7 +2262,7 @@ int rt_builtin_declare_cmd(int argc, char **argv) {
         for (const char *f = argv[i] + 1; *f; f++) {
             switch (*f) {
                 case 'a': flag_a = 1; break;
-                case 'A': flag_a = 1; break;  /* associative → treat as indexed */
+                case 'A': flag_a = 1; break;  /* associative -> treat as indexed */
                 case 'i': flag_i = 1; break;
                 case 'x': flag_x = 1; break;
                 case 'g': flag_g = 1; break;
@@ -2088,7 +2292,7 @@ int rt_builtin_declare_cmd(int argc, char **argv) {
         }
 
         if (flag_a) {
-            /* declare -a name — just ensure array exists */
+            /* declare -a name - just ensure array exists */
             /* if value given, it's not in (...) form from here, just set scalar */
             if (eq) {
                 rt_set_var(name, value);
@@ -2133,8 +2337,8 @@ static void trap_signal_handler(int sig) {
 int rt_builtin_trap_cmd(int argc, char **argv) {
     if (argc < 2) return 0;
 
-    /* trap '' SIGNAL — ignore signal */
-    /* trap - SIGNAL — reset to default */
+    /* trap '' SIGNAL - ignore signal */
+    /* trap - SIGNAL - reset to default */
     /* trap 'command' SIGNAL [...] */
 
     const char *action = argv[1];
@@ -2243,8 +2447,8 @@ int rt_builtin_kill_cmd(int argc, char **argv) {
 }
 
 /* command builtin: command [-v] name [args...]
- * command name args... — bypass functions, run external command
- * command -v name — print path of command (like which) */
+ * command name args... - bypass functions, run external command
+ * command -v name - print path of command (like which) */
 int rt_builtin_command_cmd(int argc, char **argv) {
     if (argc < 2) return 1;
 
@@ -2277,7 +2481,7 @@ int rt_builtin_command_cmd(int argc, char **argv) {
         return 1;  /* not found */
     }
 
-    /* command name args... — run bypassing functions */
+    /* command name args... - run bypassing functions */
     /* shift argv to remove "command" */
     rt_sync_env();
     pid_t pid = fork();

@@ -45,7 +45,7 @@ typedef struct VarEntry {
 
 typedef struct {
     int    argc;
-    char **argv;           /* NOT owned – caller keeps them alive */
+    char **argv;           /* NOT owned - caller keeps them alive */
     int    offset;         /* shift offset */
 } ArgFrame;
 
@@ -57,6 +57,22 @@ typedef struct ArrayEntry {
     int    cap;            /* allocated capacity */
     struct ArrayEntry *next;
 } ArrayEntry;
+
+/* ======================== Associative Array ======================== */
+#define ASSOC_HASH_SIZE 64
+
+typedef struct AssocItem {
+    char *key;
+    char *value;
+    struct AssocItem *next;
+} AssocItem;
+
+typedef struct AssocArray {
+    char      *name;
+    AssocItem *buckets[ASSOC_HASH_SIZE];
+    int        count;
+    struct AssocArray *next;
+} AssocArray;
 
 /* ======================== Runtime State ======================== */
 
@@ -72,13 +88,14 @@ typedef struct {
 typedef struct {
     VarEntry   *vars[VAR_HASH_SIZE];
     ArrayEntry *arrays[VAR_HASH_SIZE];
+    AssocArray *assocs[VAR_HASH_SIZE];   /* associative arrays (declare -A) */
     int       last_exit;
     int       scope_depth;
     ArgFrame  arg_stack[MAX_ARG_DEPTH];
     int       arg_depth;
     int       func_returning;   /* set by 'return' builtin */
-    char     *script_arg0;      /* $0 – the script name */
-    pid_t     last_bg_pid;      /* $! – last backgrounded PID */
+    char     *script_arg0;      /* $0 - the script name */
+    pid_t     last_bg_pid;      /* $! - last backgrounded PID */
     char     *self_path;        /* absolute path to this binary */
     char     *shim_dir;         /* temp dir for exported function shims */
     FuncEntry *func_table;      /* NULL-terminated array; set by generated main() */
@@ -130,6 +147,7 @@ int rt_exec_redir(char **argv,
                   const char *out_file,  int out_append,
                   const char *err_file,  int err_append);
 int rt_exec_pipeline_v(char ***cmds, int ncmds);
+int rt_exec_pipeline_bg(char ***cmds, int ncmds);
 
 /* ======================== Background Execution ======================== */
 int  rt_exec_background(char **argv);          /* fork + don't wait; sets $! */
@@ -146,8 +164,17 @@ int         rt_array_max_index(const char *name);        /* highest allocated in
 void        rt_array_set_list(const char *name, int count, char **values);
 void        rt_array_append(const char *name, const char *value);  /* arr+=(val) */
 void        rt_array_unset(const char *name);
-char       *rt_array_join(const char *name, const char *sep);  /* "${arr[*]}" – caller frees */
-char      **rt_array_get_all(const char *name, int *out_count); /* "${arr[@]}" – caller frees array, NOT strings */
+char       *rt_array_join(const char *name, const char *sep);  /* "${arr[*]}" - caller frees */
+char      **rt_array_get_all(const char *name, int *out_count); /* "${arr[@]}" - caller frees array, NOT strings */
+
+/* ======================== Associative Arrays (declare -A) ======================== */
+void        rt_assoc_set(const char *name, const char *key, const char *value);
+const char *rt_assoc_get(const char *name, const char *key);  /* returns "" if not found */
+int         rt_assoc_len(const char *name);
+void        rt_assoc_unset(const char *name);
+void        rt_assoc_unset_key(const char *name, const char *key);
+char      **rt_assoc_keys(const char *name, int *out_count);   /* caller frees array AND strings */
+char       *rt_assoc_join_values(const char *name, const char *sep);  /* caller frees */
 
 /* ======================== Word Splitting ======================== */
 char **rt_split_words(const char *str, int *out_count);  /* split by IFS; caller frees array AND strings */
