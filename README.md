@@ -153,9 +153,8 @@ Subshell fork (1000 forks)               1960ms     1652ms     1.1x
  
 ### ✅ Supported  ⚠️ Partial  ❌ Not Yet
  
-#### Variables & Expansion
  
-| Builtin ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀| Status | Notes |
+| Variables & Expansion | Status | Notes |
 |---|---|---|
 | `var=value`, `$var`, `${var}` | ✅ |
 | Single, double, backslash quoting | ✅ |
@@ -172,10 +171,9 @@ Subshell fork (1000 forks)               1960ms     1652ms     1.1x
 | `${var#pat}`, `${var##pat}` prefix strip | ❌ |
 | `${var%pat}`, `${var%%pat}` suffix strip | ❌ |
 | `${var^^}`, `${var,,}` case conversion | ❌ |
+
  
-#### Control Flow
- 
-| Builtin ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀| Status | Notes |
+| Control Flow | Status | Notes |
 |---|---|---|
 | `if` / `elif` / `else` / `fi` | ✅ |
 | `while`, `until` | ✅ |
@@ -188,10 +186,9 @@ Subshell fork (1000 forks)               1960ms     1652ms     1.1x
 | Brace groups `{ ...; }` | ✅ |
 | `select` | ❌ |
 | `coproc` | ❌ |
+
  
-#### Functions
- 
-| Builtin ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀| Status | Notes |
+| Functions | Status | Notes |
 |---|---|---|
 | `name() { body; }` and `function name { body; }` | ✅ |
 | `local`, `return`, `shift` | ✅ |
@@ -200,10 +197,9 @@ Subshell fork (1000 forks)               1960ms     1652ms     1.1x
 | Calling Bash-exported functions (`BASH_FUNC_%%`) | ✅ |
 | `--sourceable` polyglot (source or execute) | ✅ |
 | Recursive functions | ✅ |
+
  
-#### Arrays
- 
-| Builtin ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀| Status | Notes |
+| Arrays | Status | Notes |
 |---|---|---|
 | `arr=(a b c)`, `arr[i]=val` | ✅ |
 | `${arr[i]}`, `${arr[@]}`, `${arr[*]}` | ✅ |
@@ -215,10 +211,9 @@ Subshell fork (1000 forks)               1960ms     1652ms     1.1x
 | `${!map[@]}` key iteration | ✅ |
 | `${#map[@]}` entry count | ✅ |
 | `declare -A map=([k]=v ...)` inline init | ❌ |
+
  
-#### Pipes, Redirection & Jobs
- 
-| Builtin ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀| Status | Notes |
+| Pipes, Redirection & Jobs | Status | Notes |
 |---|---|---|
 | `cmd1 \| cmd2 \| cmd3` | ✅ |
 | `>`, `>>`, `<` | ✅ |
@@ -232,9 +227,8 @@ Subshell fork (1000 forks)               1960ms     1652ms     1.1x
 | Process substitution `<(cmd)`, `>(cmd)` | ❌ |
 | Arbitrary fd numbers `3>`, `exec 3>` | ❌ |
  
-#### Builtins
  
-| Builtin ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀| Status | Notes |
+| Builtins | Status | Notes |
 |---|---|---|
 | `echo` | ✅ | `-n`, `-e`, `-E`, full escape sequences |
 | `printf` | ✅ | Format repetition, `-v`, `%b`, `%s`, `%d`, `%f`, `%x`, width/precision |
@@ -262,9 +256,8 @@ Subshell fork (1000 forks)               1960ms     1652ms     1.1x
 | `mapfile` / `readarray` | ❌ | |
 | `pushd` / `popd` | ❌ | |
  
-#### Special Variables
  
-| Builtin ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀| Status | Notes |
+| Special Variables | Status | Notes |
 |---|---|---|
 | `$0`, `$1`–`$9`, `${10}+` | ✅ |
 | `$@`, `$*`, `$#` | ✅ |
