@@ -36,7 +36,8 @@ typedef struct VarEntry {
     char *name;
     char *value;
     int   exported;
-    int   scope;            /* scope depth at which this was set */
+    int   modified;          /* set when script changes the value (not from env import) */
+    int   scope;             /* scope depth at which this was set */
     struct VarEntry *next;
 } VarEntry;
 
@@ -59,7 +60,7 @@ typedef struct ArrayEntry {
 } ArrayEntry;
 
 /* ======================== Associative Array ======================== */
-#define ASSOC_HASH_SIZE 64
+#define ASSOC_HASH_SIZE 0xFFFF
 
 typedef struct AssocItem {
     char *key;
@@ -98,6 +99,7 @@ typedef struct {
     pid_t     last_bg_pid;      /* $! - last backgrounded PID */
     char     *self_path;        /* absolute path to this binary */
     char     *shim_dir;         /* temp dir for exported function shims */
+    char     *initial_cwd;      /* working directory at startup (for --source) */
     FuncEntry *func_table;      /* NULL-terminated array; set by generated main() */
     int        func_count;
 } BashRuntime;
@@ -113,9 +115,11 @@ void rt_register_functions(FuncEntry *table, int count);
 void rt_export_func(const char *name);          /* create PATH shim for function */
 BashFuncPtr rt_find_func(const char *name);     /* lookup compiled function by name */
 int  rt_dispatch_call(const char *name, int argc, char **argv);  /* --call handler */
+void rt_dump_source_output(void);               /* --source: emit shell-evaluable output */
 
 /* ======================== Variables ======================== */
 void        rt_set_var(const char *name, const char *value);
+void        rt_append_var(const char *name, const char *suffix);  /* in-place append */
 const char *rt_get_var(const char *name);       /* returns "" if unset */
 void        rt_export_var(const char *name);
 void        rt_unset_var(const char *name);

@@ -14,6 +14,20 @@ BashRuntime rt;
 /* forward declarations */
 static int try_bash_env_func(const char *name, char **argv);
 
+/* Reap the background process if it has exited.
+ * Unlike waitpid(-1), this ONLY reaps rt.last_bg_pid, so it won't
+ * interfere with popen/pclose or other waitpid callers. */
+static void reap_bg_if_done(void) {
+    if (rt.last_bg_pid > 0) {
+        int status;
+        pid_t r = waitpid(rt.last_bg_pid, &status, WNOHANG);
+        if (r == rt.last_bg_pid) {
+            /* Reaped: ps -p will no longer find this zombie */
+            rt.last_bg_pid = 0;
+        }
+    }
+}
+
 /* ================================================================
  *  Dynamic String (BStr)
  * ================================================================ */
@@ -104,13 +118,20 @@ void rt_init(int argc, char **argv) {
     }
     if (!rt.self_path) rt.self_path = strdup("shellraiser");
 
+    /* Record initial working directory for --source mode */
+    {
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof(cwd))) rt.initial_cwd = strdup(cwd);
+        else rt.initial_cwd = NULL;
+    }
+
     /* push initial argument frame (the script args) */
     rt.arg_stack[0].argc = argc > 0 ? argc - 1 : 0;
     rt.arg_stack[0].argv = argv;
     rt.arg_stack[0].offset = 0;
     rt.arg_depth = 0;
 
-    /* Set up SIGCHLD handler - use SA_RESTART so syscalls aren't
+    /* Set up SIGCHLD handler -- use SA_RESTART so syscalls aren't
      * interrupted by child exits.  We do NOT use SA_NOCLDWAIT because
      * that would auto-reap children before wait() can collect them. */
     struct sigaction sa;
@@ -163,6 +184,7 @@ void rt_cleanup(void) {
     }
     free(rt.script_arg0);
     free(rt.self_path);
+    free(rt.initial_cwd);
 
     /* Remove shim directory and all shim scripts */
     if (rt.shim_dir) {
@@ -192,10 +214,14 @@ void rt_import_env(void) {
         memcpy(name, *ep, nlen);
         name[nlen] = '\0';
         rt_set_var(name, eq + 1);
-        /* mark as exported */
+        /* mark as exported, but NOT modified (these came from the environment) */
         unsigned int h = hash_name(name);
         for (VarEntry *e = rt.vars[h]; e; e = e->next) {
-            if (strcmp(e->name, name) == 0) { e->exported = 1; break; }
+            if (strcmp(e->name, name) == 0) {
+                e->exported = 1;
+                e->modified = 0;  /* imported, not script-modified */
+                break;
+            }
         }
         free(name);
     }
@@ -212,9 +238,24 @@ void rt_sync_env(void) {
 /* Push ALL variables to the environment (for command substitution,
  * where the child shell should see all script variables). */
 static void rt_sync_all_env(void) {
+    /* Push all variables to the environment for command substitution.
+     * When a name appears at multiple scopes (e.g., local + global),
+     * only push the innermost (first in chain) value.
+     * We do this by iterating newest-first and skipping names we've seen. */
     for (int i = 0; i < VAR_HASH_SIZE; i++) {
         for (VarEntry *e = rt.vars[i]; e; e = e->next) {
-            setenv(e->name, e->value, 1);
+            /* Check if a newer (inner scope) entry for this name already
+             * exists earlier in the chain. If so, skip this one. */
+            int shadowed = 0;
+            for (VarEntry *p = rt.vars[i]; p != e; p = p->next) {
+                if (strcmp(p->name, e->name) == 0) {
+                    shadowed = 1;
+                    break;
+                }
+            }
+            if (!shadowed) {
+                setenv(e->name, e->value, 1);
+            }
         }
     }
 }
@@ -235,6 +276,7 @@ void rt_set_var(const char *name, const char *value) {
     if (e) {
         free(e->value);
         e->value = strdup(value ? value : "");
+        e->modified = 1;
         if (e->exported) setenv(name, e->value, 1);
         return;
     }
@@ -242,9 +284,25 @@ void rt_set_var(const char *name, const char *value) {
     e = (VarEntry *)calloc(1, sizeof(VarEntry));
     e->name  = strdup(name);
     e->value = strdup(value ? value : "");
+    e->modified = 1;
     e->scope = 0;  /* plain assignments always create at global scope */
     e->next  = rt.vars[h];
     rt.vars[h] = e;
+}
+
+void rt_append_var(const char *name, const char *suffix) {
+    if (!suffix || !*suffix) return;
+    VarEntry *e = find_var(name);
+    if (!e) {
+        rt_set_var(name, suffix);
+        return;
+    }
+    size_t old_len = strlen(e->value);
+    size_t suf_len = strlen(suffix);
+    e->value = (char *)realloc(e->value, old_len + suf_len + 1);
+    memcpy(e->value + old_len, suffix, suf_len + 1);
+    e->modified = 1;
+    if (e->exported) setenv(name, e->value, 1);
 }
 
 const char *rt_get_var(const char *name) {
@@ -459,12 +517,17 @@ int rt_exec_simple(char **argv) {
     /* sync exported vars before fork */
     rt_sync_env();
 
+    /* Reap zombie children (like bash does between commands).
+     * Without this, backgrounded processes stay as zombies and
+     * 'ps -p $pid' keeps finding them after they've exited. */
+    reap_bg_if_done();
+
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); rt.last_exit = 127; return 127; }
     if (pid == 0) {
         /* child */
         execvp(argv[0], argv);
-        /* execvp failed - try bash-exported function from environment */
+        /* execvp failed -- try bash-exported function from environment */
         /* (this runs in the child, so we can just _exit after) */
         int r = try_bash_env_func(argv[0], argv);
         if (r >= 0) _exit(r);
@@ -556,6 +619,9 @@ int rt_exec_redir(char **argv,
 
     rt_sync_env();
 
+    /* Reap zombie children so ps -p correctly detects exited processes */
+    reap_bg_if_done();
+
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); rt.last_exit = 127; return 127; }
     if (pid == 0) {
@@ -632,7 +698,7 @@ int rt_exec_pipeline_bg(char ***cmds, int ncmds) {
     if (ncmds == 1) return rt_exec_background(cmds[0]);
 
     /* reap stale children */
-    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+    reap_bg_if_done();
 
     rt_sync_env();
 
@@ -1405,7 +1471,7 @@ int rt_exec_background(char **argv) {
     if (!argv || !argv[0] || !argv[0][0]) { return 0; }
 
     /* reap any finished background children to prevent zombie build-up */
-    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+    reap_bg_if_done();
 
     rt_sync_env();
 
@@ -1472,6 +1538,75 @@ int rt_dispatch_call(const char *name, int argc, char **argv) {
         return 127;
     }
     return fn(argc, argv);
+}
+
+/* Shell-escape a string for safe embedding in single quotes.
+ * 'abc'  ->  'abc', "it's"  ->  'it'"'"'s' */
+static void shell_quote(FILE *out, const char *s) {
+    fputc('\'', out);
+    for (; *s; s++) {
+        if (*s == '\'') {
+            fputs("'\"'\"'", out);  /* end single-quote, double-quote the apostrophe, restart single-quote */
+        } else {
+            fputc(*s, out);
+        }
+    }
+    fputc('\'', out);
+}
+
+void rt_dump_source_output(void) {
+    /* Output shell-evaluable commands for all side effects of the script.
+     * This enables: eval "$(./compiled_script --source)" */
+
+    /* 1. Modified variables (global scope, modified by the script) */
+    for (int i = 0; i < VAR_HASH_SIZE; i++) {
+        for (VarEntry *e = rt.vars[i]; e; e = e->next) {
+            if (!e->modified) continue;
+            if (e->scope != 0) continue;  /* only global-scope vars */
+
+            /* Skip internal/special variables */
+            if (strcmp(e->name, "_") == 0) continue;
+            if (strcmp(e->name, "BASH") == 0) continue;
+            if (strcmp(e->name, "BASHOPTS") == 0) continue;
+            if (strcmp(e->name, "BASHPID") == 0) continue;
+
+            /* Output: varname='value' */
+            fprintf(stdout, "%s=", e->name);
+            shell_quote(stdout, e->value);
+            fputc('\n', stdout);
+
+            /* If exported, also output: export varname */
+            if (e->exported) {
+                fprintf(stdout, "export %s\n", e->name);
+            }
+        }
+    }
+
+    /* 2. Function wrappers -- shell functions that call back into the binary */
+    if (rt.func_table && rt.self_path) {
+        for (int i = 0; i < rt.func_count; i++) {
+            const char *fname = rt.func_table[i].name;
+            /* Output a shell function definition:
+             * funcname() { /path/to/binary --call funcname "$@"; } */
+            fprintf(stdout, "%s() { ", fname);
+            shell_quote(stdout, rt.self_path);
+            fprintf(stdout, " --call ");
+            shell_quote(stdout, fname);
+            fprintf(stdout, " \"$@\"; }\n");
+        }
+    }
+
+    /* 3. Working directory change */
+    if (rt.initial_cwd) {
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof(cwd)) && strcmp(cwd, rt.initial_cwd) != 0) {
+            fprintf(stdout, "cd ");
+            shell_quote(stdout, cwd);
+            fputc('\n', stdout);
+        }
+    }
+
+    fflush(stdout);
 }
 
 static void ensure_shim_dir(void) {
@@ -1683,7 +1818,7 @@ int rt_builtin_printf_cmd(int argc, char **argv) {
         }
     }
 
-    /* Process format string - repeat for remaining args (bash behavior:
+    /* Process format string -- repeat for remaining args (bash behavior:
      * printf "%s\n" a b c  prints all three, not just the first) */
     int ai_start;
     do {
@@ -1792,7 +1927,7 @@ int rt_builtin_printf_cmd(int argc, char **argv) {
                 const char *arg = ai < argc ? argv[ai++] : "";
                 fputc(arg[0] ? arg[0] : '\0', out);
             } else {
-                /* unknown - pass through */
+                /* unknown -- pass through */
                 spec[si++] = type; spec[si] = '\0';
                 fputs(spec, out);
             }
@@ -2148,7 +2283,7 @@ static int dblbracket_primary(int argc, char **argv, int *pos) {
     if (tok[0] == '-' && strlen(tok) == 2 && *pos + 1 < argc
             && strcmp(argv[*pos + 1], "]]") != 0) {
         char op = tok[1];
-        /* check if next token is a binary operator - if so, this is a string operand */
+        /* check if next token is a binary operator -- if so, this is a string operand */
         if (*pos + 2 < argc) {
             const char *maybe_op = argv[*pos + 1];
             if (strcmp(maybe_op, "=") == 0 || strcmp(maybe_op, "==") == 0 ||
@@ -2262,7 +2397,7 @@ int rt_builtin_declare_cmd(int argc, char **argv) {
         for (const char *f = argv[i] + 1; *f; f++) {
             switch (*f) {
                 case 'a': flag_a = 1; break;
-                case 'A': flag_a = 1; break;  /* associative -> treat as indexed */
+                case 'A': flag_a = 1; break;  /* associative  ->  treat as indexed */
                 case 'i': flag_i = 1; break;
                 case 'x': flag_x = 1; break;
                 case 'g': flag_g = 1; break;
@@ -2292,7 +2427,7 @@ int rt_builtin_declare_cmd(int argc, char **argv) {
         }
 
         if (flag_a) {
-            /* declare -a name - just ensure array exists */
+            /* declare -a name -- just ensure array exists */
             /* if value given, it's not in (...) form from here, just set scalar */
             if (eq) {
                 rt_set_var(name, value);
@@ -2317,10 +2452,12 @@ int rt_builtin_declare_cmd(int argc, char **argv) {
 /* trap builtin: trap [action] [signal ...]
  * Basic support: handles common signals and EXIT trap. */
 static char *trap_exit_cmd = NULL;
+static pid_t trap_owner_pid = 0;  /* only fire trap in the process that set it */
 
 static void trap_atexit_handler(void) {
-    if (trap_exit_cmd && *trap_exit_cmd) {
-        /* Execute the EXIT trap command via shell */
+    /* Only fire the EXIT trap in the process that registered it.
+     * Forked children inherit atexit handlers but must not run the parent's trap. */
+    if (trap_exit_cmd && *trap_exit_cmd && getpid() == trap_owner_pid) {
         int _unused = system(trap_exit_cmd);
         (void)_unused;
     }
@@ -2337,8 +2474,8 @@ static void trap_signal_handler(int sig) {
 int rt_builtin_trap_cmd(int argc, char **argv) {
     if (argc < 2) return 0;
 
-    /* trap '' SIGNAL - ignore signal */
-    /* trap - SIGNAL - reset to default */
+    /* trap '' SIGNAL -- ignore signal */
+    /* trap - SIGNAL -- reset to default */
     /* trap 'command' SIGNAL [...] */
 
     const char *action = argv[1];
@@ -2360,6 +2497,7 @@ int rt_builtin_trap_cmd(int argc, char **argv) {
                 trap_exit_cmd = NULL;
             } else {
                 trap_exit_cmd = strdup(action);
+                trap_owner_pid = getpid();
                 static int atexit_registered = 0;
                 if (!atexit_registered) {
                     atexit(trap_atexit_handler);
@@ -2447,8 +2585,8 @@ int rt_builtin_kill_cmd(int argc, char **argv) {
 }
 
 /* command builtin: command [-v] name [args...]
- * command name args... - bypass functions, run external command
- * command -v name - print path of command (like which) */
+ * command name args... -- bypass functions, run external command
+ * command -v name -- print path of command (like which) */
 int rt_builtin_command_cmd(int argc, char **argv) {
     if (argc < 2) return 1;
 
@@ -2481,7 +2619,7 @@ int rt_builtin_command_cmd(int argc, char **argv) {
         return 1;  /* not found */
     }
 
-    /* command name args... - run bypassing functions */
+    /* command name args... -- run bypassing functions */
     /* shift argv to remove "command" */
     rt_sync_env();
     pid_t pid = fork();
