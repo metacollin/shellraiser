@@ -266,39 +266,6 @@ Subshell fork (1000 forks)               1960ms     1652ms     1.1x
 | `$RANDOM`, `$LINENO`, `$FUNCNAME`, `$BASH_SOURCE` | ❌ |
 | `$PIPESTATUS`, `$BASH_REMATCH` | ❌ |
 
-## Architecture
- 
-```
-script.sh  ->  Tokenizer  ->  Parser  ->  AST  ->  Code Generator  ->  gcc/clang  ->  binary
-                                                         ^ 
-                                                runtime/bash_runtime.c
-```
- 
-**Tokenizer**: Character-level lexer handling nested quoting, `$()`, `$(())`, `$'...'`, and backticks.
- 
-**Parser**: Recursive descent producing an AST of pipelines, control flow, functions, and commands.
- 
-**Code Generator**: Emits C source. Variables live in a hash map with scoped entries. External commands use `fork`/`execvp`. Builtins are direct C function calls.
- 
-**Runtime**: Hash-mapped variables with scope stack, indexed and associative arrays, 28 builtins, pipeline execution, background jobs with zombie reaping, command substitution via `popen` with full variable sync (scope-aware), word splitting, glob expansion, trap handling, and function export via PATH shims.
- 
-**Function Export**: `export -f` creates a shim script in a temp `$PATH` directory. The shim calls `binary --call funcname "$@"`. The binary dispatches to the compiled C function. Cleanup is automatic via `atexit`.
- 
-**Sourceable Mode**: `--sourceable` produces a Bash script with the binary base64-encoded as a heredoc. On first run, it decodes to `~/.cache/shellraiser/<hash>`. When sourced, it runs the cached binary with `--source`, which executes the script body (stdout redirected to stderr) then outputs shell-evaluable commands: variable assignments and function wrappers. The caller `eval`s this output.
- 
-## Project Structure
- 
-```
-shellraiser/
-+-- shellraiser.py               # Bash to C transpiler
-+-- runtime/
-|   +-- bash_runtime.h           # Runtime API
-|   +-- bash_runtime.c           # Runtime implementation
-+-- README.md                    # You're reading it right now!
-+-- benchmark.sh                 # 14-test comprehensive benchmark
-+-- bench.sh                     # Simple perf test
-```
- 
 ## License
 
 [MIT](https://mit-license.org/)
