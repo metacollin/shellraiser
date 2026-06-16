@@ -1,3 +1,6 @@
+// MIT License
+// Copyright (c) [2026] [metacollin]
+
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 #include "bash_runtime.h"
