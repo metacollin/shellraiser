@@ -40,7 +40,7 @@ Requires Python 3.8+, GCC or Clang, Linux or macOS. The output binary is self-co
  
 ### Compiled Functions Callable From Any Shell
  
-When a compiled script calls `export -f`, the function becomes a real command on `$PATH`. Any shell, script, or tool can call it by name -- it runs as native compiled code, not interpreted Bash.
+When a compiled script calls `export -f`, the function becomes a real command on `$PATH`. Any shell, script, or tool can call it by name and it runs as native compiled code, not interpreted Bash.
  
 ```bash
 # utils.sh -- compile with shellraiser
