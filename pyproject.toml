@@ -1,13 +1,60 @@
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "shellraiser"
 version = "1.0.0"
 description = "A bash to C transpiler"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
+authors = [{ name = "metacollin", email="metacollin@gmail.com" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Programming Language :: Python :: 3.16",
+    "Programming Language :: C",
+    "Programming Language :: Unix Shell",
+    "Topic :: System :: Shells",
+    "Topic :: System :: System Shells",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Utilities",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Software Development :: Code Generators",
+    "Development Status :: 4 - Beta",
+]    
 
+[project.urls]
+Homepage = "https://github.com/metacollin/shellraiser"
+Issues   = "https://github.com/metacollin/shellraiser/issues"
+
+# Installs an executable named `shellraiser` onto the user's PATH that
+# calls shellraiser:main (the module-level main() function).
 [project.scripts]
-run-my-script = "shellraiser:main"
+shellraiser = "shellraiser.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shellraiser"]
+
+
+[tool.hatch.build]
+artifacts = [
+    "src/shellraiser/runtime/*.c",
+    "src/shellraiser/runtime/*.h",
+]
+ 
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/shellraiser",
+    "README.md",
+    "LICENSE",
+]

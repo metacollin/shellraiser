@@ -876,7 +876,7 @@ static long arith_primary(ArithCtx *ctx) {
         ctx->pos++;
         return ~arith_primary(ctx);
     }
-    if (c == '-' && !isdigit((unsigned char)ctx->src[ctx->pos + 1]) == 0) {
+    if (c == '-' && !(isdigit((unsigned char)ctx->src[ctx->pos + 1]) == 0)) {
         /* could be unary minus */
         /* always treat as unary minus */
     }

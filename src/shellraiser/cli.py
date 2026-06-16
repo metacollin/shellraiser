@@ -2883,11 +2883,17 @@ def main():
     import tempfile
     import shutil
 
-    # -- Resolve the runtime directory relative to this script --
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    runtime_dir = os.path.join(script_dir, 'runtime')
-    runtime_c   = os.path.join(runtime_dir, 'bash_runtime.c')
-    runtime_h   = os.path.join(runtime_dir, 'bash_runtime.h')
+    # -- Locate the bundled C runtime (shellraiser.runtime package) --
+    # importlib.resources lets the runtime ship as package data and be found
+    # the same way whether running from source, a wheel, or a zipapp.
+    from importlib.resources import files as _ir_files
+    _runtime_pkg = _ir_files('shellraiser.runtime')
+    for _label in ('bash_runtime.c', 'bash_runtime.h'):
+        if not _runtime_pkg.joinpath(_label).is_file():
+            print(f"shellraiser: error: runtime file '{_label}' is missing "
+                  f"from the installed shellraiser.runtime package.",
+                  file=sys.stderr)
+            sys.exit(1)
 
     # -- CLI --
     p = argparse.ArgumentParser(
@@ -2947,14 +2953,6 @@ def main():
         print(c_code)
         sys.exit(0)
 
-    # -- Validate runtime exists --
-    for path, label in [(runtime_c, 'bash_runtime.c'), (runtime_h, 'bash_runtime.h')]:
-        if not os.path.isfile(path):
-            print(f"shellraiser: error: runtime file '{label}' not found at {path}\n"
-                  f"  Expected layout: shellraiser.py and runtime/ in the same directory.",
-                  file=sys.stderr)
-            sys.exit(1)
-
     # -- Determine output binary path --
     if args.output:
         out_bin = args.output
@@ -2996,21 +2994,29 @@ def main():
         else:
             user_flags = ['-O3', '-Wall']
 
-        cmd = [
-            cc_resolved,
-            *user_flags,
-            '-std=c11',
-            f'-I{runtime_dir}',
-            c_path,
-            runtime_c,
-            '-o', out_bin,
-        ]
+        # as_file() materializes the runtime package to a real directory path
+        # (extracting from the wheel/zip if necessary) for the duration of the
+        # block -- gcc/clang need bash_runtime.c and bash_runtime.h on disk.
+            _rt_script = os.path.abspath(__file__)
+            _rt_dir = os.path.dirname(_rt_script)
+            runtime_dir = str(_rt_dir) + "/runtime"
+            runtime_c = os.path.join(runtime_dir, 'bash_runtime.c')
 
-        if args.verbose:
-            print(' '.join(cmd), file=sys.stderr)
+            cmd = [
+                cc_resolved,
+                *user_flags,
+                '-std=c11',
+                f'-I{runtime_dir}',
+                c_path,
+                runtime_c,
+                '-o', out_bin,
+            ]
 
-        # -- Compile --
-        result = subprocess.run(cmd, capture_output=True, text=True)
+            if args.verbose:
+                print(' '.join(cmd), file=sys.stderr)
+
+            # -- Compile --
+            result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
             # Show all stderr on failure, but still filter useless warnings
