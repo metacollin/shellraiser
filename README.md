@@ -8,7 +8,7 @@
 </p>
 
 # shellraiser:
- *The bash to c compiler no one asked for.* 
+ *The bash script compiler no one asked for.* 
 
 
 Compile Bash scripts to native binaries. The compiled output runs 5-12x faster on computation-heavy workloads, integrates seamlessly with the rest of your shell environment, and can export compiled functions and variables back into plain Bash sessions.
