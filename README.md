@@ -17,6 +17,14 @@ In other words, if you want to use the wrong tool (bash) for the wrong job (a co
 
 Primary legitimate usage case: speed up some of your bash completions. 
 
+## How It Works
+To put it pedantically, shellraiser is actually a bash-to-c transpiler. It takes your bash script and turns it into C code that, along with the included shellraiser C runtime, can be compiled by your installed C compiler into a native machine code binary
+without any runtime dependencies. 
+
+However, shellraiser largely automates the compilation process (assuming you have a natively supported C compiler available, such as `gcc` or `clang`), so from a usage standpoint, you just give it bash scripts and shellraiser
+gives you compiled executable binaries.
+
+
 ## Quick Start
  
 ```bash
