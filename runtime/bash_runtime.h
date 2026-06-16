@@ -1,3 +1,6 @@
+// MIT License
+// Copyright (c) [2026] [metacollin]
+
 #ifndef BASH_RUNTIME_H
 #define BASH_RUNTIME_H
 #define _DARWIN_C_SOURCE
