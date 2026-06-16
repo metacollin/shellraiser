@@ -11,6 +11,9 @@ Usage:
     shellraiser script.sh --save-source     # keep the .c file
     shellraiser script.sh --compiler clang  # use a specific compiler
     shellraiser script.sh --cflags="-O2 -g" # custom compiler flags
+
+MIT License
+Copyright (c) [2026] [metacollin]
 """
 
 import sys
