@@ -1,0 +1,113 @@
+name: Publish to PyPI
+
+# Publish when a version tag is pushed (e.g. v1.0.0), or run manually.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.15", "3.16"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (editable) + test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install -r tests/requirements-dev.txt
+
+      - name: Ensure a C compiler is present
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc
+          gcc --version
+
+      - name: Run tests
+        run: pytest -ra
+
+  build:
+    name: Build distributions
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+          python -m build
+
+      - name: Check distribution metadata
+        run: |
+          pip install twine
+          twine check dist/*
+
+      - name: Verify the wheel bundles the C runtime
+        # The runtime sources are package data; if they ever stop being
+        # included, the published package is broken. Fail the build here
+        # rather than after release.
+        run: |
+          python - <<'PY'
+          import glob, sys, zipfile
+          wheels = glob.glob("dist/*.whl")
+          assert wheels, "no wheel was built"
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          required = [
+              "shellraiser/runtime/bash_runtime.c",
+              "shellraiser/runtime/bash_runtime.h",
+          ]
+          missing = [r for r in required if r not in names]
+          if missing:
+              print("Wheel is missing required runtime files:", missing)
+              print("Wheel contents:")
+              print("\n".join(sorted(names)))
+              sys.exit(1)
+          print("Runtime files present in wheel:", required)
+          PY
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/shellraiser/
+    permissions:
+      id-token: write  # required for Trusted Publishing
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1

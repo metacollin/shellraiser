@@ -1677,6 +1677,34 @@ class CodeGen:
         self.indent += 1
         self._push_cleanup()
 
+        # Special case: arr=($(cmd)) -- a single command substitution whose
+        # output must be word-split into separate elements (matches bash and
+        # the prefix-position path in _gen_inline_array_inits). Without this,
+        # the lone CmdSubstPart falls through to the literal path below and the
+        # whole output is stored as one element.
+        if (len(node.items) == 1 and len(node.items[0].parts) == 1
+                and isinstance(node.items[0].parts[0], CmdSubstPart)):
+            cmd_str = node.items[0].parts[0].command
+            cs_expr = self._gen_cmd_subst_expr(cmd_str)
+            tmp = self._tmp('_cs')
+            self._emit(f'char *{tmp} = {cs_expr};')
+            wc = self._tmp('_wc')
+            wv = self._tmp('_wv')
+            self._emit(f'int {wc} = 0;')
+            self._emit(f'char **{wv} = rt_split_words({tmp}, &{wc});')
+            self._emit(f'free({tmp});')
+            self._emit(f'rt_array_unset("{c_escape(node.name)}");')
+            wi = self._tmp('_wi')
+            self._emit(f'for (int {wi} = 0; {wi} < {wc}; {wi}++)')
+            self.indent += 1
+            self._emit(f'rt_array_append("{c_escape(node.name)}", {wv}[{wi}]);')
+            self.indent -= 1
+            self._emit(f'rt_split_free({wv}, {wc});')
+            self._pop_cleanup()
+            self.indent -= 1
+            self._emit('}')
+            return
+
         item_exprs = []
         for w in node.items:
             expr = self._gen_word_expr(w)
