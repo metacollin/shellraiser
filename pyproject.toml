@@ -7,21 +7,18 @@ name = "shellraiser"
 version = "1.0.0"
 description = "A bash to C transpiler"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICEN[CS]E*"]
 authors = [{ name = "metacollin", email="metacollin@gmail.com" }]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
-    "Programming Language :: Python :: 3.15",
-    "Programming Language :: Python :: 3.16",
     "Programming Language :: C",
     "Programming Language :: Unix Shell",
     "Topic :: System :: Shells",
