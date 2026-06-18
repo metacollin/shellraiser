@@ -25,16 +25,29 @@ However, shellraiser largely automates the compilation process (assuming you hav
 gives you compiled executable binaries.
 
 
-## Quick Start
- 
+## Install
 ```bash
-./shellraiser script.sh              #  ->  ./script (native binary)
-./shellraiser script.sh -o mybin     # custom output name
-./shellraiser script.sh --sourceable # polyglot: source OR execute (see below)
-./shellraiser script.sh --emit-only  # just print the generated C
+pip install shellraiser
+```
+
+Or directly from the repo:
+```bash
+git clone https://github.com/metacollin/shellraiser.git
+cd shellraiser
+pip install .
+```
+
+
+## Quick Start
+
+```bash
+shellraiser script.sh              #  ->  ./script (native binary)
+shellraiser script.sh -o mybin     # custom output name
+shellraiser script.sh --sourceable # polyglot: source OR execute (see below)
+shellraiser script.sh --emit-only  # just print the generated C
 ```
  
-Requires Python 3.8+, GCC or Clang, Linux or macOS. The output binary is self-contained with no runtime dependencies.
+Requires Python 3.10+, GCC or Clang, Linux or macOS. The output binary is self-contained with no runtime dependencies.
  
 ## Key Features
  
@@ -64,7 +77,7 @@ This also works in reverse: if a parent Bash session exports a function with `ex
 With `--sourceable`, the output is a single file that can be both executed and sourced:
  
 ```bash
-./shellraiser mylib.sh -o mylib --sourceable
+shellraiser mylib.sh -o mylib --sourceable
 ```
  
 ```bash
